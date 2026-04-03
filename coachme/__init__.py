@@ -970,6 +970,35 @@ class ProfileReferences(foo.Operator):
 
         # Store profile as dataset info (metadata)
         dataset.info["training_dna"] = profile
+
+        # ── DATA CURATION: tag each sample with technique, angle, quality ──
+        ctx.set_progress(label="Tagging samples with curation metadata...", progress=0.9)
+        video_profiles = profile.get("video_descriptions", [])
+        for vp in video_profiles:
+            filepath = vp.get("filepath", "")
+            if not filepath:
+                continue
+            matched = dataset.match(F("filepath") == filepath)
+            if len(matched) == 0:
+                continue
+            s = matched.first()
+            s["technique"] = vp.get("technique", "unknown")
+            s["camera_angle"] = vp.get("angle", "unknown")
+            s["skill_level"] = vp.get("skill_level", "unknown")
+            s["curation_quality"] = vp.get("duration_quality", "unknown")
+            s.save()
+
+        # Tag near-duplicates
+        for nd in profile.get("near_duplicates", []):
+            for fp in [nd.get("video_a", ""), nd.get("video_b", "")]:
+                if not fp:
+                    continue
+                matched = dataset.match(F("filepath") == fp)
+                if len(matched) > 0:
+                    s = matched.first()
+                    s.tags.append("near-duplicate")
+                    s.save()
+
         dataset.save()
 
         ctx.set_progress(label="TrainingDNA complete!", progress=1.0)
@@ -992,7 +1021,152 @@ class ProfileReferences(foo.Operator):
 
 
 # ─────────────────────────────────────────────
-# Register all 7 operators
+# Operator 8: Curate References (Data Curation)
+# ─────────────────────────────────────────────
+
+class CurateReferences(foo.Operator):
+    @property
+    def config(self):
+        return foo.OperatorConfig(
+            name="curate_references",
+            label="CoachMe+: Curate Reference Library",
+            description="Compute embedding similarity, find duplicates, tag quality — smart data curation for your reference library",
+            icon="/assets/icon.svg",
+            dynamic=True,
+        )
+
+    def resolve_input(self, ctx):
+        inputs = types.Object()
+        inputs.str(
+            "sport",
+            label="Sport to Curate",
+            required=True,
+        )
+
+        sport = ctx.params.get("sport", "")
+        if sport:
+            ds_name = f"coachme-reference-{sport.strip().lower()}"
+            if fo.dataset_exists(ds_name):
+                ds = fo.load_dataset(ds_name)
+                inputs.view(
+                    "info",
+                    types.Notice(label=f"'{ds_name}' has {len(ds)} video(s). Curation will:\n"
+                        f"• Compute pairwise embedding similarity\n"
+                        f"• Build similarity index for visual exploration\n"
+                        f"• Tag near-duplicates for removal\n"
+                        f"• Score each video's uniqueness"),
+                )
+            else:
+                inputs.view("warn", types.Warning(label=f"No dataset for '{sport}'."))
+
+        return types.Property(inputs)
+
+    def execute(self, ctx):
+        sport = ctx.params.get("sport", "").strip().lower()
+        ds_name = f"coachme-reference-{sport}"
+        if not fo.dataset_exists(ds_name):
+            return {"status": "error", "details": f"No dataset for '{sport}'"}
+
+        dataset = fo.load_dataset(ds_name)
+        client = get_client()
+
+        # Step 1: Ensure all samples have embeddings
+        ctx.set_progress(label="Computing embeddings...", progress=0.1)
+        samples = list(dataset)
+        embeddings = []
+        for i, s in enumerate(samples):
+            emb = _get_sample_field(s, "tl_embedding")
+            if emb:
+                embeddings.append(np.array(emb))
+            else:
+                ctx.set_progress(
+                    label=f"Embedding {os.path.basename(s.filepath)} ({i+1}/{len(samples)})...",
+                    progress=0.1 + 0.4 * i / len(samples),
+                )
+                emb = get_video_embedding(client, s.filepath)
+                s["tl_embedding"] = emb
+                s.save()
+                embeddings.append(np.array(emb))
+
+        if len(embeddings) < 2:
+            return {"status": "done", "details": "Need at least 2 videos to curate"}
+
+        # Step 2: Compute pairwise similarity and uniqueness scores
+        ctx.set_progress(label="Computing pairwise similarity...", progress=0.6)
+        n = len(embeddings)
+        similarity_matrix = np.zeros((n, n))
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    similarity_matrix[i][j] = 1.0
+                else:
+                    similarity_matrix[i][j] = cosine_similarity(embeddings[i], embeddings[j])
+
+        # Step 3: Tag samples with uniqueness and duplicate info
+        ctx.set_progress(label="Tagging samples...", progress=0.8)
+        dup_threshold = 0.92
+        duplicates_found = 0
+
+        for i, s in enumerate(samples):
+            # Uniqueness = 1 - max similarity to any other video
+            other_sims = [similarity_matrix[i][j] for j in range(n) if j != i]
+            max_sim = max(other_sims) if other_sims else 0
+            uniqueness = round((1 - max_sim) * 100, 1)
+            s["uniqueness_score"] = uniqueness
+            s["max_similarity"] = round(max_sim * 100, 1)
+
+            # Find most similar video
+            most_similar_idx = max((j for j in range(n) if j != i), key=lambda j: similarity_matrix[i][j])
+            s["most_similar_to"] = os.path.basename(samples[most_similar_idx].filepath)
+
+            # Tag near-duplicates
+            if max_sim > dup_threshold:
+                if "near-duplicate" not in s.tags:
+                    s.tags.append("near-duplicate")
+                duplicates_found += 1
+            else:
+                if "unique" not in s.tags:
+                    s.tags.append("unique")
+
+            s.save()
+
+        # Step 4: Store similarity matrix as brain result for FiftyOne visualization
+        ctx.set_progress(label="Building similarity index...", progress=0.9)
+        try:
+            import fiftyone.brain as fob
+            emb_array = np.array(embeddings)
+            dataset.set_values("embedding", [e.tolist() for e in embeddings])
+            fob.compute_similarity(dataset, brain_key="technique_sim", embeddings="embedding")
+        except Exception:
+            pass  # Brain visualization is optional
+
+        dataset.save()
+        ctx.set_progress(label="Curation complete!", progress=1.0)
+        ctx.trigger("open_dataset", {"name": ds_name})
+
+        # Build summary
+        unique_count = sum(1 for s in samples if "unique" in s.tags)
+        avg_uniqueness = round(np.mean([_get_sample_field(s, "uniqueness_score", 0) for s in samples]), 1)
+
+        return {
+            "status": "done",
+            "details": (
+                f"Curated {len(samples)} videos\n"
+                f"Unique: {unique_count} | Near-duplicates: {duplicates_found}\n"
+                f"Avg uniqueness: {avg_uniqueness}%\n"
+                f"Tip: Filter by 'near-duplicate' tag to review redundant clips"
+            ),
+        }
+
+    def resolve_output(self, ctx):
+        outputs = types.Object()
+        outputs.str("status", label="Status")
+        outputs.str("details", label="Curation Results")
+        return types.Property(outputs)
+
+
+# ─────────────────────────────────────────────
+# Register all 8 operators
 # ─────────────────────────────────────────────
 
 def register(p):
@@ -1003,3 +1177,4 @@ def register(p):
     p.register(SyncTechnique)
     p.register(ValidateCoaching)
     p.register(ProfileReferences)
+    p.register(CurateReferences)
