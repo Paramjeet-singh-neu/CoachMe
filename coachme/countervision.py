@@ -12,6 +12,15 @@ import json
 import re
 
 
+def _safe_get(sample, field, default=None):
+    """Safely get a field from a FiftyOne sample."""
+    try:
+        val = sample[field]
+        return val if val is not None else default
+    except (KeyError, AttributeError):
+        return default
+
+
 def _parse_counterfactual_json(raw_text):
     """Parse Pegasus response into list of counterfactual pairs.
 
@@ -82,10 +91,10 @@ def find_correct_form(athlete_sample, reference_index_id, client, ctx=None, spor
     Returns:
         list[dict] — counterfactual matches with reference segments
     """
-    coaching_text = athlete_sample.get("coaching_feedback", "")
+    coaching_text = _safe_get(athlete_sample, "coaching_feedback", "")
     if sport is None:
-        sport = athlete_sample.get("sport", "general")
-    video_id = athlete_sample.get("tl_video_id", "")
+        sport = _safe_get(athlete_sample, "sport", "general")
+    video_id = _safe_get(athlete_sample, "tl_video_id", "")
 
     if not coaching_text or not video_id:
         return []

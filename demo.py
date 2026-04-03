@@ -173,7 +173,8 @@ def main():
         if profile["near_duplicates"]:
             print(f"  Near-duplicates: {len(profile['near_duplicates'])}")
             for nd in profile["near_duplicates"]:
-                print(f"    {os.path.basename(nd['video_a'])} <-> {os.path.basename(nd['video_b'])}: {nd['similarity']}%")
+                sim = nd.get('similarity', nd.get('note', 'similar'))
+                print(f"    {os.path.basename(nd['video_a'])} <-> {os.path.basename(nd['video_b'])}: {sim}")
         if profile["coverage_gaps"]:
             print(f"  Gaps:")
             for gap in profile["coverage_gaps"]:
@@ -318,7 +319,7 @@ def main():
         sample["counterfactual_matches"] = cv_matches
         sample.save()
 
-        print(f"  Found {len(cv_matches)} problem→correction matches:")
+        print(f"  Found {len(cv_matches)} problem->correction matches:")
         for m in cv_matches:
             print(f"    [{m.get('timestamp', '?')}] {m.get('problem_description', '?')}")
             print(f"      Correct: {m.get('correct_description', '?')}")

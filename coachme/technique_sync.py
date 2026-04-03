@@ -12,6 +12,15 @@ import re
 import numpy as np
 
 
+def _safe_get(sample, field, default=None):
+    """Safely get a field from a FiftyOne sample."""
+    try:
+        val = sample[field]
+        return val if val is not None else default
+    except (KeyError, AttributeError):
+        return default
+
+
 def _parse_phases(raw_text):
     """Parse Pegasus phase response into structured list.
 
@@ -235,8 +244,8 @@ def sync_technique(athlete_sample, reference_sample, skill_name, client, ctx=Non
     Returns:
         dict with phases, overall_sync_score, and skill name
     """
-    athlete_vid = athlete_sample.get("tl_video_id", "")
-    reference_vid = reference_sample.get("tl_video_id", "")
+    athlete_vid = _safe_get(athlete_sample, "tl_video_id", "")
+    reference_vid = _safe_get(reference_sample, "tl_video_id", "")
 
     if not athlete_vid or not reference_vid:
         return {"phases": [], "overall_sync_score": 0.0, "skill": skill_name}
