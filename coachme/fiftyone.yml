@@ -1,0 +1,13 @@
+name: "@team/coachme"
+description: "CoachMe+ — AI Sports Coach with Counterfactual Analysis, Temporal Alignment, Hallucination Detection & Dataset Profiling"
+version: 1.0.0
+author: "Aatmaj Rajore, Paramjeet Singh & Tanay Mihani"
+fiftyone:
+  version: "*"
+
+operators:
+  - validate_coaching
+  - profile_references
+
+secrets:
+  - TWELVELABS_API_KEY
