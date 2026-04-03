@@ -1,0 +1,19 @@
+name: "@team/coachme"
+description: "CoachMe+ — AI Sports Coach with Counterfactual Analysis, Temporal Alignment, Hallucination Detection & Dataset Profiling"
+version: 1.0.0
+fiftyone:
+  version: "*"
+url: https://github.com/YOUR_USERNAME/coachme-plus
+license: Apache 2.0
+
+operators:
+  - load_reference_videos
+  - analyze_technique
+  - view_coaching_report
+  - find_correct_form
+  - sync_technique
+  - validate_coaching
+  - profile_references
+
+secrets:
+  - TWELVELABS_API_KEY

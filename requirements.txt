@@ -1,0 +1,3 @@
+fiftyone
+twelvelabs
+python-dotenv
