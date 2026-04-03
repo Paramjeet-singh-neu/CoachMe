@@ -8,11 +8,38 @@ movement.
 Powered by: Pegasus (counterfactual generation) + Marengo (semantic search)
 """
 
+import json
 import re
 
 
-def parse_counterfactual_pairs(raw_text):
-    """Parse Pegasus output into structured problem/correction pairs."""
+def _parse_counterfactual_json(raw_text):
+    """Parse Pegasus response into list of counterfactual pairs.
+
+    Tries JSON parsing first, falls back to regex extraction.
+    """
+    if not raw_text:
+        return []
+
+    # Tier 1: JSON extraction (most reliable when Pegasus cooperates)
+    try:
+        json_match = re.search(r'\[.*\]', raw_text, re.DOTALL)
+        if json_match:
+            pairs = json.loads(json_match.group())
+            if isinstance(pairs, list) and len(pairs) > 0:
+                valid = []
+                for p in pairs:
+                    if isinstance(p, dict) and "problem" in p and "correct_form" in p:
+                        valid.append({
+                            "problem": str(p["problem"]),
+                            "timestamp": str(p.get("timestamp", "0:00")),
+                            "correct_form": str(p["correct_form"]),
+                        })
+                if valid:
+                    return valid
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    # Tier 2: Regex fallback for labeled text format
     pairs = []
     current = {}
 
@@ -38,10 +65,10 @@ def parse_counterfactual_pairs(raw_text):
         p.setdefault("correct_form", "Proper technique with correct body positioning")
         p.setdefault("timestamp", "0:00")
 
-    return pairs
+    return pairs if pairs else []
 
 
-def find_correct_form(athlete_sample, reference_index_id, client, ctx=None):
+def find_correct_form(athlete_sample, reference_index_id, client, ctx=None, sport=None):
     """
     For each coaching problem, find the matching correct-form reference segment.
 
@@ -50,12 +77,14 @@ def find_correct_form(athlete_sample, reference_index_id, client, ctx=None):
         reference_index_id: Twelve Labs index ID containing reference videos
         client: TwelveLabs client
         ctx: Optional operator context for progress updates
+        sport: Optional sport override (falls back to sample field)
 
     Returns:
         list[dict] — counterfactual matches with reference segments
     """
     coaching_text = athlete_sample.get("coaching_feedback", "")
-    sport = athlete_sample.get("sport", "general")
+    if sport is None:
+        sport = athlete_sample.get("sport", "general")
     video_id = athlete_sample.get("tl_video_id", "")
 
     if not coaching_text or not video_id:
@@ -65,33 +94,49 @@ def find_correct_form(athlete_sample, reference_index_id, client, ctx=None):
     if ctx:
         ctx.set_progress(label="Generating counterfactual descriptions...", progress=0.2)
 
-    counterfactual_prompt = f"""Based on this coaching feedback for a {sport} athlete:
+    counterfactual_prompt = f"""You are analyzing coaching feedback for a {sport} athlete.
+
+Based on this coaching feedback:
 
 {coaching_text}
 
-For each specific problem identified, describe what CORRECT technique
-looks like for that exact moment. Be very specific about body positioning,
-timing, and movement mechanics.
+For each specific technique problem identified, generate a JSON array where each element has:
+- "problem": brief description of the error (1 sentence)
+- "timestamp": approximate time in the video (e.g., "0:04-0:06")
+- "correct_form": very specific description of what CORRECT technique looks like for that movement — include body positioning, angles, timing, and mechanics (1-2 sentences)
 
-Format EXACTLY as (one group per problem):
-PROBLEM: [brief description of the error]
-CORRECT FORM: [specific description of what correct form looks like]
-TIMESTAMP: [when in the video this occurs, e.g. 0:04]
+Return ONLY valid JSON array, no other text. Example:
+[
+  {{"problem": "Left elbow drops before jab extension", "timestamp": "0:04-0:06", "correct_form": "Elbow stays tucked close to ribcage, arm extends in a straight line from shoulder with fist rotating at full extension"}}
+]
+
+If JSON is not possible, format as:
+PROBLEM: [description]
+CORRECT FORM: [description]
+TIMESTAMP: [time]
 """
 
-    counterfactual_result = client.analyze(
-        video_id=video_id,
-        prompt=counterfactual_prompt,
-    )
-    raw_text = getattr(counterfactual_result, "data", None) or str(counterfactual_result)
-    if not isinstance(raw_text, str):
-        raw_text = str(raw_text)
-
-    pairs = parse_counterfactual_pairs(raw_text)
-    if not pairs:
+    try:
+        counterfactual_result = client.analyze(
+            video_id=video_id,
+            prompt=counterfactual_prompt,
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        raw_text = getattr(counterfactual_result, "data", None) or str(counterfactual_result)
+        if not isinstance(raw_text, str):
+            raw_text = str(raw_text)
+    except Exception as e:
+        print(f"[CounterVision] Pegasus counterfactual generation failed: {e}")
         return []
 
-    # Step 2: For each correction, search reference library with Marengo
+    # Step 2: Parse the counterfactual pairs (JSON first, regex fallback)
+    pairs = _parse_counterfactual_json(raw_text)
+    if not pairs:
+        print("[CounterVision] Could not parse counterfactual pairs from Pegasus response")
+        return []
+
+    # Step 3: For each correction, search reference library with Marengo
     matches = []
     for i, pair in enumerate(pairs):
         if ctx:
@@ -113,11 +158,12 @@ TIMESTAMP: [when in the video this occurs, e.g. 0:04]
             if search_data:
                 top = search_data[0]
                 vid_id = getattr(top, "video_id", None) or getattr(top, "id", None)
-                rank = getattr(top, "rank", 1) or 1
                 start = getattr(top, "start", 0)
                 end = getattr(top, "end", 0)
-                # Top result gets high confidence, decreasing by rank
-                confidence = round(max(0, 100 - (rank - 1) * 15), 1)
+                score = getattr(top, "score", None)
+                rank = getattr(top, "rank", 1) or 1
+                # Use score if available, otherwise derive from rank
+                confidence = round(float(score) * 100, 1) if score else round(max(0, 100 - (rank - 1) * 15), 1)
 
                 matches.append({
                     "problem_description": pair["problem"],
@@ -139,6 +185,7 @@ TIMESTAMP: [when in the video this occurs, e.g. 0:04]
                     "confidence": 0.0,
                 })
         except Exception as e:
+            print(f"[CounterVision] Marengo search failed for pair: {e}")
             matches.append({
                 "problem_description": pair["problem"],
                 "correct_description": pair["correct_form"],
@@ -147,7 +194,6 @@ TIMESTAMP: [when in the video this occurs, e.g. 0:04]
                 "reference_start": 0.0,
                 "reference_end": 0.0,
                 "confidence": 0.0,
-                "error": str(e),
             })
 
     return matches
