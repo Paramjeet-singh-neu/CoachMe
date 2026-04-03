@@ -1,0 +1,4 @@
+fiftyone
+twelvelabs
+python-dotenv
+numpy

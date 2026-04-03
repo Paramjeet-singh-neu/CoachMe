@@ -1,0 +1,12 @@
+name: "@team/coachme"
+version: "1.0.0"
+description: "AI sports coach with counterfactual analysis, temporal alignment, hallucination detection & dataset profiling — powered by Twelve Labs Marengo + Pegasus"
+fiftyone_compatibility: ">=0.23"
+operators:
+  - load_reference_videos
+  - analyze_technique
+  - view_coaching_report
+  - find_correct_form
+  - sync_technique
+  - validate_coaching
+  - profile_references

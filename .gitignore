@@ -1,0 +1,10 @@
+hackathon-env/
+.venv/
+.env
+__pycache__/
+*.pyc
+.fiftyone/
+.ipynb_checkpoints/
+.DS_Store
+demo-videos/
+.claude/
