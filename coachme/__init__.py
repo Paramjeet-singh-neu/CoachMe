@@ -21,7 +21,11 @@ from twelvelabs import TwelveLabs
 from twelvelabs.indexes.types import IndexesCreateRequestModelsItem
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from the project directory (not the plugin install location)
+_plugin_dir = os.path.dirname(os.path.abspath(__file__))
+_project_env = os.path.join(os.path.dirname(_plugin_dir), ".env")
+load_dotenv(_project_env)
+load_dotenv()  # Also try default locations
 
 
 # ─────────────────────────────────────────────
@@ -468,72 +472,112 @@ class ViewCoachingReport(foo.Operator):
                 counterfactuals = _get_sample_field(sample, "counterfactual_matches")
                 phase_align = _get_sample_field(sample, "phase_alignment")
 
-                header = (
-                    f"**Sport:** {sport.upper()}  |  "
-                    f"**Similarity:** {score}%  |  "
-                    f"**Focus:** {focus}  |  "
-                    f"**Analyzed:** {analyzed}"
+                # ── HEADER: Overview Dashboard ──
+                score_label = "Excellent" if score >= 85 else "Good" if score >= 70 else "Needs Work"
+                header_md = (
+                    f"# CoachMe+ Report: {sport.upper()}\n\n"
+                    f"| Metric | Value |\n"
+                    f"|--------|-------|\n"
+                    f"| **Similarity Score** | **{score}%** ({score_label}) |\n"
+                    f"| **Focus Area** | {focus} |\n"
+                    f"| **Analyzed** | {analyzed} |\n"
+                    f"| **Video** | {os.path.basename(sample.filepath)} |\n"
                 )
-                inputs.view("header", types.Notice(label=header))
+                inputs.view("header", types.MarkdownView(label=header_md))
 
+                # ── SECTION 1: Reference Matches ──
                 if matches:
-                    match_lines = "\n".join(
-                        f"  - {os.path.basename(m.get('reference_filepath', '?'))}: {m.get('similarity_pct', 0)}%"
-                        for m in matches
-                    )
-                    inputs.view("matches_info", types.Notice(label=f"**Reference Matches:**\n{match_lines}"))
+                    match_md = "## Reference Matches\n\n"
+                    match_md += "| Reference Video | Similarity |\n|---|---|\n"
+                    for m in matches:
+                        pct = m.get("similarity_pct", 0)
+                        bar = ">" * int(pct / 5) if pct else ""
+                        match_md += f"| {os.path.basename(m.get('reference_filepath', '?'))} | **{pct}%** {bar} |\n"
+                    inputs.view("matches_info", types.MarkdownView(label=match_md))
 
-                inputs.view("feedback_display", types.Notice(label=f"**Coaching Feedback:**\n\n{feedback}"))
+                # ── SECTION 2: AI Coaching Feedback ──
+                feedback_md = "## AI Coaching Feedback (Pegasus)\n\n" + feedback
+                inputs.view("feedback_display", types.MarkdownView(label=feedback_md))
 
-                # Show CoachCheck results if available
+                # ── SECTION 3: CoachCheck Validation ──
                 if validation:
                     g_score = validation.get("grounding_score", 0)
                     h_count = validation.get("hallucinations_flagged", 0)
-                    total_claims = len(validation.get("claims", []))
-                    inputs.view(
-                        "validation_info",
-                        types.Notice(
-                            label=f"**CoachCheck Validation:** {g_score}% grounded | "
-                            f"{total_claims - h_count}/{total_claims} claims verified | "
-                            f"{h_count} hallucination(s) flagged"
-                        ),
-                    )
+                    claims = validation.get("claims", [])
+                    total_claims = len(claims)
+                    trust_label = "High Trust" if g_score >= 80 else "Moderate Trust" if g_score >= 60 else "Low Trust"
 
-                # Show CounterVision results if available
+                    val_md = (
+                        f"## CoachCheck: Hallucination Detection\n\n"
+                        f"**Grounding Score: {g_score}%** ({trust_label}) | "
+                        f"**{total_claims - h_count}/{total_claims}** claims verified | "
+                        f"**{h_count}** hallucination(s) caught\n\n"
+                    )
+                    if claims:
+                        val_md += "| Status | Claim | Timestamp | Confidence |\n|---|---|---|---|\n"
+                        for c in claims:
+                            status = "GROUNDED" if c.get("is_grounded") else "HALLUCINATION"
+                            val_md += (
+                                f"| **{status}** | {c.get('original_claim', '?')[:80]} | "
+                                f"{c.get('timestamp', '?')} | {c.get('confidence', '?')} |\n"
+                            )
+                    inputs.view("validation_info", types.MarkdownView(label=val_md))
+
+                # ── SECTION 4: CounterVision ──
                 if counterfactuals:
-                    cf_lines = []
-                    for cf in counterfactuals:
-                        cf_lines.append(
-                            f"  - [{cf.get('timestamp', '?')}] Problem: {cf.get('problem_description', '?')}\n"
-                            f"    Correct: {cf.get('correct_description', '?')} "
-                            f"(confidence: {cf.get('confidence', 0)}%)"
+                    cf_md = f"## CounterVision: What Should You Have Done?\n\n"
+                    cf_md += f"Found **{len(counterfactuals)}** problem-to-correction matches:\n\n"
+                    for i, cf in enumerate(counterfactuals, 1):
+                        conf = cf.get("confidence", 0)
+                        cf_md += (
+                            f"### Problem {i}: [{cf.get('timestamp', '?')}]\n"
+                            f"**Issue:** {cf.get('problem_description', '?')}\n\n"
+                            f"**Correct Form:** {cf.get('correct_description', '?')}\n\n"
+                            f"**Match Confidence:** {conf}%\n\n"
+                            f"---\n\n"
                         )
-                    inputs.view(
-                        "counterfactual_info",
-                        types.Notice(label=f"**CounterVision Matches:**\n" + "\n".join(cf_lines)),
-                    )
+                    inputs.view("counterfactual_info", types.MarkdownView(label=cf_md))
 
-                # Show TechniqueSync results if available
+                # ── SECTION 5: TechniqueSync ──
                 if phase_align:
                     sync_score = phase_align.get("overall_sync_score", 0)
                     phases = phase_align.get("phases", [])
-                    phase_lines = []
-                    for p in phases:
-                        delta = p.get("timing_delta_seconds", 0)
-                        direction = "slower" if delta > 0 else "faster" if delta < 0 else "same"
-                        phase_lines.append(
-                            f"  - {p.get('athlete_phase', '?')}: {p.get('athlete_time', '?')} "
-                            f"vs ref {p.get('reference_time', '?')} ({abs(delta):.2f}s {direction})"
-                        )
-                    inputs.view(
-                        "sync_info",
-                        types.Notice(
-                            label=f"**TechniqueSync:** Overall sync {sync_score:.1%}\n" + "\n".join(phase_lines)
-                        ),
-                    )
+                    sync_label = "Excellent" if sync_score >= 0.9 else "Good" if sync_score >= 0.7 else "Needs Work"
 
-            except Exception:
-                inputs.view("err", types.Warning(label="Could not load this sample."))
+                    sync_md = (
+                        f"## TechniqueSync: Phase Alignment\n\n"
+                        f"**Overall Sync Score: {sync_score:.1%}** ({sync_label})\n\n"
+                    )
+                    if phases:
+                        sync_md += "| Phase | Your Timing | Pro Timing | Delta | Alignment |\n|---|---|---|---|---|\n"
+                        for p in phases:
+                            delta = p.get("timing_delta_seconds", 0)
+                            if delta > 0.1:
+                                direction = f"+{delta:.2f}s SLOWER"
+                            elif delta < -0.1:
+                                direction = f"{delta:.2f}s FASTER"
+                            else:
+                                direction = "ON PACE"
+                            a_score = p.get("alignment_score", 0)
+                            sync_md += (
+                                f"| **{p.get('athlete_phase', '?')}** | {p.get('athlete_time', '?')} | "
+                                f"{p.get('reference_time', '?')} | {direction} | {a_score:.1%} |\n"
+                            )
+                    inputs.view("sync_info", types.MarkdownView(label=sync_md))
+
+                # ── FOOTER: Features used ──
+                features_used = ["Core Analysis"]
+                if validation: features_used.append("CoachCheck")
+                if counterfactuals: features_used.append("CounterVision")
+                if phase_align: features_used.append("TechniqueSync")
+                footer_md = (
+                    f"\n---\n*CoachMe+ features active: {' | '.join(features_used)}*\n\n"
+                    f"*\"Elite athletes have coaches. Everyone else has CoachMe+.\"*"
+                )
+                inputs.view("footer", types.MarkdownView(label=footer_md))
+
+            except Exception as e:
+                inputs.view("err", types.Warning(label=f"Could not load this sample: {e}"))
 
         return types.Property(inputs)
 
