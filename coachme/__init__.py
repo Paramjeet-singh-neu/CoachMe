@@ -922,7 +922,7 @@ class ProfileReferences(foo.Operator):
         client = get_client()
 
         ctx.set_progress(label="Running TrainingDNA analysis...", progress=0.1)
-        profile = profile_references(dataset, sport, client, threshold, ctx=ctx)
+        profile = profile_references(dataset, sport, client, similarity_threshold=threshold, ctx=ctx)
 
         # Store profile as dataset info (metadata)
         dataset.info["training_dna"] = profile

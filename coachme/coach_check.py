@@ -1,79 +1,145 @@
 """
 CoachCheck — AI Coaching Hallucination Detector
 
-Validates that coaching feedback is actually grounded in what's visible
-in the video. Cross-checks each claim with an independent Pegasus pass.
+Validates that CoachMe+'s coaching feedback is actually grounded in
+what's visible in the video. Cross-checks AI coaching claims with
+independent Pegasus verification passes.
 
-Powered by: Pegasus (claim extraction + independent verification)
+Uses: Twelve Labs Pegasus 1.2 (via client.analyze())
 """
+
+import re
+import time
+
+
+def _analyze_with_retry(client, prompt, video_id, max_retries=5):
+    """Call client.analyze() with automatic retry on rate-limit (429)."""
+    for attempt in range(max_retries):
+        try:
+            return client.analyze(prompt=prompt, video_id=video_id)
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in err_str or "too_many_requests" in err_str or "rate" in err_str:
+                wait = min(10 * (2 ** attempt), 60)
+                import re as _re
+                match = _re.search(r"retry-after.*?(\d+)", str(e))
+                if match:
+                    wait = int(match.group(1)) + 1
+                print(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
+    raise RuntimeError(f"Failed after {max_retries} retries due to rate limiting")
 
 
 def parse_claims(raw_text):
-    """Parse extracted claims from Pegasus output."""
+    """Parse Pegasus claim-extraction output into structured list.
+
+    Expected format from Pegasus:
+        CLAIM 1: <claim text> | TIMESTAMP: <time> | ABOUT: <body part>
+        CLAIM 2: ...
+
+    Returns list of dicts with keys: text, timestamp, about.
+    """
     claims = []
-    for line in raw_text.strip().split("\n"):
+    pattern = re.compile(
+        r"CLAIM\s*\d+\s*:\s*(.+?)\s*\|\s*TIMESTAMP\s*:\s*(.+?)\s*\|\s*ABOUT\s*:\s*(.+)",
+        re.IGNORECASE,
+    )
+    for line in raw_text.strip().splitlines():
         line = line.strip()
-        if not line or not line.upper().startswith("CLAIM"):
+        if not line:
             continue
-
-        # Format: CLAIM N: [text] | TIMESTAMP: [time] | ABOUT: [body part]
-        parts = line.split("|")
-        claim_text = parts[0].split(":", 1)[1].strip() if ":" in parts[0] else parts[0]
-        timestamp = ""
-        about = ""
-
-        for part in parts[1:]:
-            part = part.strip()
-            if part.upper().startswith("TIMESTAMP:"):
-                timestamp = part.split(":", 1)[1].strip()
-            elif part.upper().startswith("ABOUT:"):
-                about = part.split(":", 1)[1].strip()
-
-        if claim_text:
+        match = pattern.match(line)
+        if match:
             claims.append({
-                "text": claim_text,
-                "timestamp": timestamp or "0:00",
-                "about": about or "technique",
+                "text": match.group(1).strip(),
+                "timestamp": match.group(2).strip(),
+                "about": match.group(3).strip(),
             })
+    # Fallback: if structured parsing found nothing, try a looser split
+    if not claims:
+        claims = _fallback_parse_claims(raw_text)
+    return claims
 
+
+def _fallback_parse_claims(raw_text):
+    """Looser parser when Pegasus doesn't follow the exact format."""
+    claims = []
+    for line in raw_text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if re.match(r"^(\d+[\.\):]|[-*])\s+", line):
+            text = re.sub(r"^(\d+[\.\):]|[-*])\s+", "", line).strip()
+            ts_match = re.search(
+                r"(\d+:\d{2}(?:\s*[-\u2013]\s*\d+:\d{2})?|\d+\.?\d*\s*s(?:ec)?)",
+                text,
+            )
+            timestamp = ts_match.group(1) if ts_match else "unknown"
+            claims.append({
+                "text": text,
+                "timestamp": timestamp,
+                "about": "technique",
+            })
     return claims
 
 
 def parse_verification(raw_text):
-    """Parse verification response from Pegasus."""
+    """Parse Pegasus verification response.
+
+    Expected format:
+        ACCURATE: yes/no
+        WHAT I SEE: <observation>
+        CONFIDENCE: high/medium/low
+    """
     result = {
         "accurate": False,
         "what_i_see": raw_text.strip(),
-        "confidence": "medium",
+        "confidence": "low",
     }
 
-    for line in raw_text.strip().split("\n"):
-        line = line.strip().upper()
-        if line.startswith("ACCURATE:"):
-            val = line.split(":", 1)[1].strip().lower()
-            result["accurate"] = val in ("yes", "true", "correct", "confirmed")
-        elif line.startswith("WHAT I SEE:"):
-            result["what_i_see"] = line.split(":", 1)[1].strip()
-        elif line.startswith("CONFIDENCE:"):
-            result["confidence"] = line.split(":", 1)[1].strip().lower()
+    accurate_match = re.search(
+        r"ACCURATE\s*:\s*(yes|no|true|false)", raw_text, re.IGNORECASE
+    )
+    if accurate_match:
+        val = accurate_match.group(1).lower()
+        result["accurate"] = val in ("yes", "true")
+
+    see_match = re.search(
+        r"WHAT I SEE\s*:\s*(.+?)(?:\n|CONFIDENCE|$)",
+        raw_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if see_match:
+        result["what_i_see"] = see_match.group(1).strip()
+
+    conf_match = re.search(
+        r"CONFIDENCE\s*:\s*(high|medium|low)", raw_text, re.IGNORECASE
+    )
+    if conf_match:
+        result["confidence"] = conf_match.group(1).lower()
 
     return result
 
 
 def validate_coaching(athlete_sample, client, ctx=None):
-    """
-    Validate each coaching claim against the actual video content.
+    """Validate coaching feedback claims against the actual video.
 
     Args:
-        athlete_sample: FiftyOne sample with coaching_feedback and tl_video_id
-        client: TwelveLabs client
-        ctx: Optional operator context for progress updates
+        athlete_sample: FiftyOne sample with 'coaching_feedback' and
+            'tl_video_id' fields already populated by CoachMe Core.
+        client: Initialized TwelveLabs client.
+        ctx: Optional operator context for progress updates.
 
     Returns:
-        dict with claims, grounding_score, and hallucinations_flagged
+        dict with keys:
+            claims        - list of per-claim validation dicts
+            grounding_score - percentage of claims verified as grounded
+            hallucinations_flagged - count of ungrounded claims
     """
-    coaching_text = athlete_sample.get("coaching_feedback", "")
-    video_id = athlete_sample.get("tl_video_id", "")
+    coaching_text = athlete_sample["coaching_feedback"]
+    video_id = athlete_sample["tl_video_id"]
 
     if not coaching_text or not video_id:
         return {
@@ -86,37 +152,30 @@ def validate_coaching(athlete_sample, client, ctx=None):
     if ctx:
         ctx.set_progress(label="Extracting coaching claims...", progress=0.1)
 
-    extraction_prompt = f"""From this coaching feedback, extract each specific factual claim
-about the athlete's technique. For each claim, provide:
-- The exact claim made
-- The timestamp referenced (if any)
-- What body part or movement it's about
-
-Coaching feedback:
-{coaching_text}
-
-Format EXACTLY as:
-CLAIM 1: [claim text] | TIMESTAMP: [time] | ABOUT: [body part/movement]
-CLAIM 2: [claim text] | TIMESTAMP: [time] | ABOUT: [body part/movement]
-"""
-
-    claims_result = client.analyze(
-        video_id=video_id,
-        prompt=extraction_prompt,
+    extraction_prompt = (
+        "From the coaching feedback below, extract each specific factual "
+        "claim about the athlete's technique. For each claim, provide:\n"
+        "- The exact claim made\n"
+        "- The timestamp referenced (if any, otherwise write 'general')\n"
+        "- What body part or movement it is about\n\n"
+        f"Coaching feedback:\n{coaching_text}\n\n"
+        "Format EACH claim on its own line exactly as:\n"
+        "CLAIM 1: <claim text> | TIMESTAMP: <time> | ABOUT: <body part or movement>\n"
+        "CLAIM 2: <claim text> | TIMESTAMP: <time> | ABOUT: <body part or movement>\n"
+        "... and so on."
     )
-    claims_raw = getattr(claims_result, "data", None) or str(claims_result)
-    if not isinstance(claims_raw, str):
-        claims_raw = str(claims_raw)
 
-    claims = parse_claims(claims_raw)
+    claims_response = _analyze_with_retry(client, extraction_prompt, video_id)
+    claims = parse_claims(claims_response.data)
+
     if not claims:
         return {
             "claims": [],
-            "grounding_score": 0.0,
+            "grounding_score": 100.0,
             "hallucinations_flagged": 0,
         }
 
-    # Step 2: Independently verify each claim
+    # Step 2: Independently verify each claim via Pegasus
     validated_claims = []
     for i, claim in enumerate(claims):
         if ctx:
@@ -125,52 +184,40 @@ CLAIM 2: [claim text] | TIMESTAMP: [time] | ABOUT: [body part/movement]
                 progress=0.2 + (0.7 * i / len(claims)),
             )
 
-        verification_prompt = f"""Look at this video at approximately {claim['timestamp']}.
+        verification_prompt = (
+            f"Look at this video at approximately {claim['timestamp']}.\n\n"
+            f"Describe exactly what you see regarding {claim['about']}. "
+            "Be very specific about position, angle, and movement.\n\n"
+            "Then answer: Does the following statement accurately describe "
+            "what is happening?\n\n"
+            f'Statement: "{claim["text"]}"\n\n'
+            "Answer with EXACTLY this format:\n"
+            "ACCURATE: yes or no\n"
+            "WHAT I SEE: <your independent observation>\n"
+            "CONFIDENCE: high, medium, or low"
+        )
 
-Describe exactly what you see regarding {claim['about']}.
-Be very specific about position, angle, and movement.
+        verification_response = _analyze_with_retry(client, verification_prompt, video_id)
 
-Then answer: Does the following statement accurately describe what's happening?
+        parsed = parse_verification(verification_response.data)
+        validated_claims.append({
+            "original_claim": claim["text"],
+            "timestamp": claim["timestamp"],
+            "about": claim["about"],
+            "verification_response": parsed["what_i_see"],
+            "is_grounded": parsed["accurate"],
+            "confidence": parsed["confidence"],
+        })
 
-Statement: "{claim['text']}"
-
-Answer with EXACTLY this format:
-ACCURATE: [yes or no]
-WHAT I SEE: [your independent observation]
-CONFIDENCE: [high, medium, or low]
-"""
-
-        try:
-            verification_result = client.analyze(
-                video_id=video_id,
-                prompt=verification_prompt,
-            )
-            ver_raw = getattr(verification_result, "data", None) or str(verification_result)
-            if not isinstance(ver_raw, str):
-                ver_raw = str(ver_raw)
-
-            parsed = parse_verification(ver_raw)
-            validated_claims.append({
-                "original_claim": claim["text"],
-                "timestamp": claim["timestamp"],
-                "verification_response": parsed["what_i_see"],
-                "is_grounded": parsed["accurate"],
-                "confidence": parsed["confidence"],
-            })
-        except Exception as e:
-            validated_claims.append({
-                "original_claim": claim["text"],
-                "timestamp": claim["timestamp"],
-                "verification_response": f"Verification failed: {e}",
-                "is_grounded": False,
-                "confidence": "low",
-            })
-
+    # Step 3: Compute aggregate scores
     grounded_count = sum(1 for c in validated_claims if c["is_grounded"])
     total = len(validated_claims)
 
+    if ctx:
+        ctx.set_progress(label="CoachCheck validation complete!", progress=1.0)
+
     return {
         "claims": validated_claims,
-        "grounding_score": round(grounded_count / total * 100, 1) if total > 0 else 0.0,
+        "grounding_score": round(grounded_count / total * 100, 1) if total else 0.0,
         "hallucinations_flagged": total - grounded_count,
     }
