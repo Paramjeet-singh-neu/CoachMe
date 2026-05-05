@@ -1,6 +1,6 @@
-# CoachMe+ — AI Sports Coach Plugin for FiftyOne
+# CoachMe — AI Sports Coach Plugin for FiftyOne
 
-> **"Elite athletes have coaches. Everyone else has CoachMe+."**
+> **"Elite athletes have coaches. Everyone else has CoachMe."**
 
 A FiftyOne plugin that turns any video library into an AI coaching system. Upload reference technique videos, record yourself, and get instant feedback — similarity scores, timestamped coaching, hallucination-checked analysis, and smart data curation.
 
@@ -207,9 +207,9 @@ Works with any sport that has reference footage. Tested with:
 
 ## Why Data Curation Matters
 
-CoachMe+ isn't just an analysis tool — it's a **data curation system** for coaching video libraries.
+CoachMe isn't just an analysis tool — it's a **data curation system** for coaching video libraries.
 
-| Without Curation | With CoachMe+ Curation |
+| Without Curation | With CoachMe Curation |
 |------------------|----------------------|
 | 50 random YouTube clips | 5 curated clips covering all techniques |
 | Duplicate angles everywhere | Uniqueness-scored, duplicates tagged |
